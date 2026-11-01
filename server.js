@@ -265,6 +265,12 @@ app.post('/api/kembali', async (req, res) => {
 
 
 // Jalankan server
-app.listen(PORT, () => {
-  console.log(`Backend berjalan di http://localhost:${PORT}`);
-});
+// Jalankan server lokal
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Backend berjalan di http://localhost:${PORT}`);
+  });
+}
+
+// Ekspor aplikasi untuk Vercel
+module.exports = app;
