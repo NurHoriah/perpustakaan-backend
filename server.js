@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const NODE_ID = process.env.NODE_ID || 'Node Default';
 
 app.use(cors());
 app.use(express.json());
@@ -36,18 +37,19 @@ app.get('/api/status', async (req, res) => {
 
     res.json({
       status: 'ok',
+      node: NODE_ID,
       message: 'Backend dan database terhubung'
     });
-  }  catch (error) {
-  console.error('Koneksi database gagal:', error);
+  } catch (error) {
+    console.error('Koneksi database gagal:', error);
 
-  res.status(500).json({
-    status: 'error',
-    message: 'Koneksi database gagal',
-    detail: error.message,
-    code: error.code
-  });
-}
+    res.status(500).json({
+      status: 'error',
+      message: 'Koneksi database gagal',
+      detail: error.message,
+      code: error.code
+    });
+  }
 });
 
 // Menampilkan daftar buku
@@ -63,6 +65,51 @@ app.get('/api/buku', async (req, res) => {
 
     res.status(500).json({
       message: 'Gagal mengambil data buku'
+    });
+  }
+});
+
+// Menambahkan buku baru
+app.post('/api/buku', async (req, res) => {
+  const { judul, penulis, stok } = req.body;
+
+  const parsedStok = Number(stok);
+
+  if (
+    !judul ||
+    !String(judul).trim() ||
+    !penulis ||
+    !String(penulis).trim() ||
+    stok === undefined ||
+    stok === null ||
+    typeof stok === 'boolean' ||
+    (typeof stok === 'string' && stok.trim() === '') ||
+    !Number.isInteger(parsedStok) ||
+    parsedStok < 0
+  ) {
+    return res.status(400).json({
+      message: 'Judul, penulis, dan stok (bilangan bulat non-negatif) wajib diisi'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO public.buku (judul, penulis, stok)
+       VALUES ($1, $2, $3)
+       RETURNING id, judul, penulis, stok`,
+      [String(judul).trim(), String(penulis).trim(), parsedStok]
+    );
+
+    res.status(201).json({
+      message: 'Buku berhasil ditambahkan',
+      buku: result.rows[0],
+      ...result.rows[0]
+    });
+  } catch (error) {
+    console.error('Gagal menambahkan buku:', error.message);
+
+    res.status(500).json({
+      message: 'Gagal menambahkan buku'
     });
   }
 });
@@ -84,8 +131,90 @@ app.get('/api/anggota', async (req, res) => {
   }
 });
 
+// Menambahkan anggota baru
+app.post('/api/anggota', async (req, res) => {
+  const { nama, email } = req.body;
 
- // Meminjam buku
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  if (
+    !nama ||
+    !String(nama).trim() ||
+    !email ||
+    !String(email).trim()
+  ) {
+    return res.status(400).json({
+      message: 'Nama dan email wajib diisi'
+    });
+  }
+
+  const cleanNama = String(nama).trim();
+  const cleanEmail = String(email).trim().toLowerCase();
+
+  if (!emailRegex.test(cleanEmail)) {
+    return res.status(400).json({
+      message: 'Format email tidak valid'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO public.anggota (nama, email)
+       VALUES ($1, $2)
+       RETURNING id, nama, email`,
+      [cleanNama, cleanEmail]
+    );
+
+    res.status(201).json({
+      message: 'Anggota berhasil ditambahkan',
+      anggota: result.rows[0],
+      ...result.rows[0]
+    });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({
+        message: 'Email sudah terdaftar'
+      });
+    }
+
+    console.error('Gagal menambahkan anggota:', error.message);
+
+    res.status(500).json({
+      message: 'Gagal menambahkan anggota'
+    });
+  }
+});
+
+// Menampilkan riwayat peminjaman
+app.get('/api/peminjaman', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        p.id,
+        a.nama AS nama_anggota,
+        b.judul AS judul_buku,
+        p.cabang,
+        p.tanggal_pinjam,
+        p.tanggal_kembali,
+        p.status
+      FROM public.peminjaman p
+      JOIN public.anggota a ON p.id_anggota = a.id
+      JOIN public.buku b ON p.id_buku = b.id
+      ORDER BY p.tanggal_pinjam DESC, p.id DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Gagal mengambil data peminjaman:', error.message);
+
+    res.status(500).json({
+      message: 'Gagal mengambil data peminjaman'
+    });
+  }
+});
+
+
+// Meminjam buku
 app.post('/api/pinjam', async (req, res) => {
   const { id_buku, id_anggota, cabang } = req.body;
 
@@ -100,10 +229,14 @@ app.post('/api/pinjam', async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
+  let client;
+  let transactionStarted = false;
 
   try {
+    client = await pool.connect();
+
     await client.query('BEGIN');
+    transactionStarted = true;
 
     // Kunci baris buku agar stok aman saat ada
     // permintaan peminjaman bersamaan dari dua cabang.
@@ -159,20 +292,28 @@ app.post('/api/pinjam', async (req, res) => {
       peminjaman: pinjamResult.rows[0]
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client && transactionStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Rollback gagal:', rollbackError.message);
+      }
+    }
     console.error('Peminjaman gagal:', error.message);
 
     res.status(500).json({
       message: 'Terjadi kesalahan saat meminjam buku'
     });
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 });
 
 
 
- // Mengembalikan buku
+// Mengembalikan buku
 app.post('/api/kembali', async (req, res) => {
   const id_peminjaman = Number(req.body.id_peminjaman);
 
@@ -265,12 +406,10 @@ app.post('/api/kembali', async (req, res) => {
 
 
 // Jalankan server
-// Jalankan server lokal
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`Backend berjalan di http://localhost:${PORT}`);
+    console.log(`${NODE_ID} berjalan di http://localhost:${PORT}`);
   });
 }
 
-// Ekspor aplikasi untuk Vercel
 module.exports = app;
