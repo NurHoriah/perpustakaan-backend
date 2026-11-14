@@ -114,6 +114,150 @@ app.post('/api/buku', async (req, res) => {
   }
 });
 
+// Mengedit data buku berdasarkan ID
+app.put('/api/buku/:id', async (req, res) => {
+  const id = Number(req.params.id);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({
+      message: 'ID buku harus berupa bilangan bulat positif'
+    });
+  }
+
+  const { judul, penulis, stok } = req.body;
+  const parsedStok = Number(stok);
+
+  if (
+    !judul ||
+    !String(judul).trim() ||
+    !penulis ||
+    !String(penulis).trim() ||
+    stok === undefined ||
+    stok === null ||
+    typeof stok === 'boolean' ||
+    (typeof stok === 'string' && stok.trim() === '') ||
+    !Number.isInteger(parsedStok) ||
+    parsedStok < 0
+  ) {
+    return res.status(400).json({
+      message: 'Judul, penulis, dan stok (bilangan bulat non-negatif) wajib diisi'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE public.buku
+       SET judul = $1, penulis = $2, stok = $3
+       WHERE id = $4
+       RETURNING id, judul, penulis, stok`,
+      [String(judul).trim(), String(penulis).trim(), parsedStok, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: 'Buku tidak ditemukan'
+      });
+    }
+
+    res.status(200).json({
+      message: 'Buku berhasil diperbarui',
+      buku: result.rows[0],
+      ...result.rows[0]
+    });
+  } catch (error) {
+    console.error('Gagal memperbarui buku:', error.message);
+
+    res.status(500).json({
+      message: 'Gagal memperbarui data buku'
+    });
+  }
+});
+
+// Menghapus data buku berdasarkan ID
+app.delete('/api/buku/:id', async (req, res) => {
+  const id = Number(req.params.id);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({
+      message: 'ID buku harus berupa bilangan bulat positif'
+    });
+  }
+
+  let client;
+  let transactionStarted = false;
+
+  try {
+    client = await pool.connect();
+
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    // Kunci baris buku menggunakan FOR UPDATE selama proses penghapusan
+    const bukuResult = await client.query(
+      'SELECT id, judul FROM public.buku WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+
+    if (bukuResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        message: 'Buku tidak ditemukan'
+      });
+    }
+
+    // Periksa apakah buku pernah tercatat di tabel peminjaman
+    const pinjamResult = await client.query(
+      'SELECT id FROM public.peminjaman WHERE id_buku = $1 LIMIT 1',
+      [id]
+    );
+
+    if (pinjamResult.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        message: 'Buku tidak dapat dihapus karena memiliki riwayat peminjaman'
+      });
+    }
+
+    // Hapus buku jika belum pernah dipinjam
+    const deleteResult = await client.query(
+      'DELETE FROM public.buku WHERE id = $1 RETURNING id, judul',
+      [id]
+    );
+
+    await client.query('COMMIT');
+
+    res.status(200).json({
+      message: 'Buku berhasil dihapus',
+      id: id,
+      buku: deleteResult.rows[0]
+    });
+  } catch (error) {
+    if (client && transactionStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Rollback gagal:', rollbackError.message);
+      }
+    }
+
+    if (error.code === '23503') {
+      return res.status(409).json({
+        message: 'Buku tidak dapat dihapus karena masih terkait dengan data lain'
+      });
+    }
+
+    console.error('Gagal menghapus buku:', error.message);
+
+    res.status(500).json({
+      message: 'Gagal menghapus buku'
+    });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
 // Menampilkan daftar anggota
 app.get('/api/anggota', async (req, res) => {
   try {
